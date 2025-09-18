@@ -1,0 +1,4 @@
+.venv_pv2/
+.env.pv2
+__pycache__/
+*.pyc
