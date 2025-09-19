@@ -50,6 +50,7 @@ def index():
 
   <script>
     let room = null;
+    let audioCtx = null;
 
     const logEl  = document.getElementById('log');
     const hintEl = document.getElementById('hint');
@@ -61,13 +62,12 @@ def index():
     const log = (m) => { logEl.textContent += m + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
     function showHint(msg){ hintEl.textContent = msg; hintEl.style.display='block'; }
 
-    const appendAudio = (track) => {
+    function appendAudio(track) {
       const el = track.attach();
       el.autoplay = true; el.playsInline = true; el.muted = false; el.volume = 1.0;
       document.body.appendChild(el);
-      // на всякий випадок — явний play()
       el.play?.().catch(()=>{});
-    };
+    }
 
     async function getToken(roomName, identity) {
       const r = await fetch(`/token?room=${encodeURIComponent(roomName)}&identity=${encodeURIComponent(identity)}`);
@@ -75,20 +75,43 @@ def index():
       return r.json();
     }
 
-    async function enableMicUniversal(room) {
+    async function enableMic(room) {
       const constraints = { echoCancellation:true, noiseSuppression:true, autoGainControl:true };
       const localTrack = await LivekitClient.createLocalAudioTrack(constraints);
       await room.localParticipant.publishTrack(localTrack, { name: 'microphone' });
-      log('microphone published');
+      log('mic published');
     }
 
-    async function ensureAudio(room) {
-      // офіційний спосіб розблокувати аудіо після юзер-жесту
-      const ok = await room.startAudio();
-      log('startAudio() -> ' + ok);
-      if (!ok) {
-        unmuteBtn.style.display = 'inline-block';
-        showHint('Браузер заблокував звук. Натисни "Unmute / Start Audio".');
+    async function unlockAudioPlayback() {
+      try {
+        // 1) Resume/construct AudioContext (універсальний розблок)
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          if (!audioCtx) audioCtx = new AC();
+          if (audioCtx.state === 'suspended') await audioCtx.resume();
+          log('AudioContext: ' + audioCtx.state);
+        } else {
+          log('AudioContext: unavailable');
+        }
+
+        // 2) Якщо у LiveKit є startAudio — викличемо теж
+        if (room && typeof room.startAudio === 'function') {
+          const res = await room.startAudio();
+          log('room.startAudio() -> ' + res);
+        } else {
+          log('room.startAudio() not available');
+        }
+
+        // 3) Спробувати відтворити всі вже додані <audio>
+        document.querySelectorAll('audio').forEach(a => {
+          a.muted = false; a.volume = 1.0;
+          a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
+        });
+
+        unmuteBtn.style.display = 'none';
+        hintEl.style.display = 'none';
+      } catch (e) {
+        log('unlock error: ' + (e?.message || e));
       }
     }
 
@@ -100,7 +123,7 @@ def index():
 
         const { url, token } = await getToken(roomName, identity);
 
-        // чекаємо глобальник
+        // чекаємо UMD
         await new Promise(res => {
           if (window.LivekitClient) return res();
           const id = setInterval(() => { if (window.LivekitClient) { clearInterval(id); res(); } }, 50);
@@ -111,11 +134,19 @@ def index():
         await room.connect(url, token);
         log('connected as ' + identity + ' to room ' + roomName);
 
-        await enableMicUniversal(room);
+        await enableMic(room);
 
-        // важливо: розблокувати плейбек
-        await ensureAudio(room);
+        // одразу покажемо кнопку вимкненого звуку (деякі браузери ігнорять автозапуск)
+        unmuteBtn.style.display = 'inline-block';
+        showHint('Браузер міг заблокувати звук. Натисни "Unmute / Start Audio".');
+        await unlockAudioPlayback();
 
+        room.on('participantConnected', p => log('participant connected: ' + p.identity));
+        room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
+        room.on('trackSubscribed', (track, pub, participant) => {
+          log('track subscribed from ' + participant.identity + ' kind=' + track.kind);
+          if (track.kind === 'audio') appendAudio(track);
+        });
         room.on('audioPlaybackStatusChanged', (playing) => {
           log('audioPlaybackStatusChanged: ' + playing);
           if (!playing) {
@@ -125,13 +156,6 @@ def index():
             unmuteBtn.style.display = 'none';
             hintEl.style.display = 'none';
           }
-        });
-
-        room.on('participantConnected', p => log('participant connected: ' + p.identity));
-        room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
-        room.on('trackSubscribed', (track, pub, participant) => {
-          log('track subscribed from ' + participant.identity + ' kind=' + track.kind);
-          if (track.kind === 'audio') appendAudio(track);
         });
         room.on('disconnected', () => log('room disconnected'));
 
@@ -152,14 +176,7 @@ def index():
     };
 
     unmuteBtn.onclick = async () => {
-      if (!room) return;
-      try {
-        const ok = await room.startAudio();
-        log('manual startAudio() -> ' + ok);
-        if (ok) { unmuteBtn.style.display = 'none'; hintEl.style.display = 'none'; }
-      } catch (e) {
-        log('ERROR startAudio: ' + (e?.message || e));
-      }
+      await unlockAudioPlayback();
     };
   </script>
 </body>
