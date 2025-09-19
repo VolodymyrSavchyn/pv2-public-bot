@@ -60,13 +60,40 @@ def index():
     const nameEl = document.getElementById('name');
 
     const log = (m) => { logEl.textContent += m + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
-    function showHint(msg){ hintEl.textContent = msg; hintEl.style.display='block'; }
+    const showHint = (msg) => { hintEl.textContent = msg; hintEl.style.display='block'; };
 
     function appendAudio(track) {
       const el = track.attach();
       el.autoplay = true; el.playsInline = true; el.muted = false; el.volume = 1.0;
       document.body.appendChild(el);
-      el.play?.().catch(()=>{});
+      el.play?.().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
+    }
+
+    async function unlockAudioPlayback() {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          if (!audioCtx) audioCtx = new AC();
+          if (audioCtx.state === 'suspended') await audioCtx.resume();
+          log('AudioContext: ' + audioCtx.state);
+        } else {
+          log('AudioContext: unavailable');
+        }
+        if (room && typeof room.startAudio === 'function') {
+          const res = await room.startAudio();
+          log('room.startAudio() -> ' + res);
+        } else {
+          log('room.startAudio() not available');
+        }
+        document.querySelectorAll('audio').forEach(a => {
+          a.muted = false; a.volume = 1.0;
+          a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
+        });
+        unmuteBtn.style.display = 'none';
+        hintEl.style.display = 'none';
+      } catch (e) {
+        log('unlock error: ' + (e?.message || e));
+      }
     }
 
     async function getToken(roomName, identity) {
@@ -82,37 +109,56 @@ def index():
       log('mic published');
     }
 
-    async function unlockAudioPlayback() {
+    // --- НОВЕ: примусова підписка на всі аудіо-треки учасника ---
+    function subscribeParticipantAudio(p) {
       try {
-        // 1) Resume/construct AudioContext (універсальний розблок)
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) {
-          if (!audioCtx) audioCtx = new AC();
-          if (audioCtx.state === 'suspended') await audioCtx.resume();
-          log('AudioContext: ' + audioCtx.state);
-        } else {
-          log('AudioContext: unavailable');
+        log('ensure subscribe for ' + (p.identity || 'unknown'));
+        // існуючі публікації
+        if (p.tracks && typeof p.tracks.forEach === 'function') {
+          p.tracks.forEach(pub => {
+            if (pub && pub.kind === 'audio') {
+              log('found pub(kind=audio) from ' + (p.identity || '?') + ', subscribed=' + pub.subscribed);
+              if (!pub.subscribed) {
+                pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok')).catch(e=>log('setSubscribed err: '+(e?.message||e)));
+              }
+            }
+          });
         }
-
-        // 2) Якщо у LiveKit є startAudio — викличемо теж
-        if (room && typeof room.startAudio === 'function') {
-          const res = await room.startAudio();
-          log('room.startAudio() -> ' + res);
-        } else {
-          log('room.startAudio() not available');
+        // нові публікації
+        if (typeof p.on === 'function') {
+          p.on('trackPublished', (pub) => {
+            log('trackPublished from ' + (p.identity||'?') + ' kind=' + pub?.kind);
+            if (pub?.kind === 'audio' && !pub.subscribed) {
+              pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok (on publish)')).catch(e=>log('setSubscribed err (on publish): '+(e?.message||e)));
+            }
+          });
         }
-
-        // 3) Спробувати відтворити всі вже додані <audio>
-        document.querySelectorAll('audio').forEach(a => {
-          a.muted = false; a.volume = 1.0;
-          a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
-        });
-
-        unmuteBtn.style.display = 'none';
-        hintEl.style.display = 'none';
       } catch (e) {
-        log('unlock error: ' + (e?.message || e));
+        log('subscribeParticipantAudio error: ' + (e?.message || e));
       }
+    }
+
+    function wireRoomEvents() {
+      room.on('participantConnected', p => {
+        log('participant connected: ' + p.identity);
+        subscribeParticipantAudio(p);
+      });
+      room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
+      room.on('trackSubscribed', (track, pub, participant) => {
+        log('track subscribed from ' + (participant.identity||'?') + ' kind=' + (track?.kind));
+        if (track?.kind === 'audio') appendAudio(track);
+      });
+      room.on('audioPlaybackStatusChanged', (playing) => {
+        log('audioPlaybackStatusChanged: ' + playing);
+        if (!playing) {
+          unmuteBtn.style.display = 'inline-block';
+          showHint('Натисни "Unmute / Start Audio", щоб увімкнути звук.');
+        } else {
+          unmuteBtn.style.display = 'none';
+          hintEl.style.display = 'none';
+        }
+      });
+      room.on('disconnected', () => log('room disconnected'));
     }
 
     joinBtn.onclick = async () => {
@@ -123,41 +169,36 @@ def index():
 
         const { url, token } = await getToken(roomName, identity);
 
-        // чекаємо UMD
         await new Promise(res => {
           if (window.LivekitClient) return res();
           const id = setInterval(() => { if (window.LivekitClient) { clearInterval(id); res(); } }, 50);
           setTimeout(() => { clearInterval(id); res(); }, 2000);
         });
 
-        room = new LivekitClient.Room();
+        room = new LivekitClient.Room({ adaptiveStream: false, dynacast: false, autoSubscribe: true });
         await room.connect(url, token);
         log('connected as ' + identity + ' to room ' + roomName);
 
+        wireRoomEvents();
+
+        // підписатися на всіх, хто вже в кімнаті (наприклад, pv2-agent)
+        try {
+          const parts = room.participants;
+          if (parts && typeof parts.forEach === 'function') {
+            parts.forEach((p, sid) => { log('existing participant: ' + p.identity); subscribeParticipantAudio(p); });
+          } else {
+            log('participants map not iterable, value: ' + String(parts));
+          }
+        } catch (e) {
+          log('iter participants err: ' + (e?.message || e));
+        }
+
         await enableMic(room);
 
-        // одразу покажемо кнопку вимкненого звуку (деякі браузери ігнорять автозапуск)
+        // показати кнопку розблокування звуку
         unmuteBtn.style.display = 'inline-block';
         showHint('Браузер міг заблокувати звук. Натисни "Unmute / Start Audio".');
         await unlockAudioPlayback();
-
-        room.on('participantConnected', p => log('participant connected: ' + p.identity));
-        room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
-        room.on('trackSubscribed', (track, pub, participant) => {
-          log('track subscribed from ' + participant.identity + ' kind=' + track.kind);
-          if (track.kind === 'audio') appendAudio(track);
-        });
-        room.on('audioPlaybackStatusChanged', (playing) => {
-          log('audioPlaybackStatusChanged: ' + playing);
-          if (!playing) {
-            unmuteBtn.style.display = 'inline-block';
-            showHint('Натисни "Unmute / Start Audio", щоб увімкнути звук.');
-          } else {
-            unmuteBtn.style.display = 'none';
-            hintEl.style.display = 'none';
-          }
-        });
-        room.on('disconnected', () => log('room disconnected'));
 
         leaveBtn.disabled = false;
       } catch (e) {
