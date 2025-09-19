@@ -1,8 +1,7 @@
-import os
+import os, time, jwt
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from livekit import api as lk_api
 
 app = FastAPI()
 app.add_middleware(
@@ -33,11 +32,7 @@ def index():
     button { padding:8px 14px; }
     .warn { color:#f90; }
   </style>
-
-  <!-- 1) WebRTC shim: додає navigator.mediaDevices.getUserMedia де його нема -->
   <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
-
-  <!-- 2) LiveKit UMD (два дзеркала на випадок блокування) -->
   <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
   <script>
     if (!window.LivekitClient) {
@@ -71,16 +66,6 @@ def index():
     const log = (m) => { logEl.textContent += m + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
     function showHint(msg){ hintEl.textContent = msg; hintEl.style.display='block'; }
 
-    // діагностика браузера
-    function dumpEnv() {
-      const n = typeof navigator !== 'undefined' ? navigator : {};
-      const md = n.mediaDevices;
-      log("diag: has navigator=" + !!navigator
-        + ", mediaDevices=" + !!md
-        + ", getUserMedia=" + !!(md && md.getUserMedia)
-        + ", legacy=" + !!(n.getUserMedia || n.webkitGetUserMedia || n.mozGetUserMedia));
-    }
-
     const appendAudio = (track) => {
       const el = track.attach(); el.autoplay = true; el.playsInline = true;
       document.body.appendChild(el);
@@ -93,7 +78,6 @@ def index():
     }
 
     async function enableMicUniversal(room) {
-      // 1) офіційний шлях LiveKit
       try {
         await new Promise(res => {
           if (window.LivekitClient) return res();
@@ -104,26 +88,9 @@ def index():
         const localTrack = await LivekitClient.createLocalAudioTrack(constraints);
         await room.localParticipant.publishTrack(localTrack, { name: 'microphone' });
         log('microphone published (createLocalAudioTrack)');
-        return;
       } catch (e) {
-        log('WARN: createLocalAudioTrack failed: ' + (e?.message || e));
-      }
-
-      // 2) фолбек через getUserMedia (після adapter.js має зʼявитися)
-      try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error('getUserMedia not available');
-        }
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const [audioTrack] = stream.getAudioTracks();
-        if (!audioTrack) throw new Error('no audio track from getUserMedia');
-        await room.localParticipant.publishTrack(audioTrack, { name: 'microphone' });
-        log('microphone published (fallback gUM)');
-        return;
-      } catch (e) {
-        log('ERROR: gUM fallback failed: ' + (e?.message || e));
-        showHint('Схоже, у цьому браузері вимкнено WebRTC API. Спробуй Chrome/Firefox/Edge або iOS Safari, і обовʼязково відкривай через HTTPS (на публічному домені).');
-        dumpEnv();
+        log('ERROR mic: ' + (e?.message || e));
+        showHint('Спробуй інший браузер/пристрій та переконайся, що сторінка по HTTPS.');
         throw e;
       }
     }
@@ -179,9 +146,20 @@ def index():
 def token(room: str = Query(...), identity: str = Query(...)):
     if not (LK_URL and LK_KEY and LK_SECRET):
         raise HTTPException(500, "LiveKit env not set on server")
-    grants = lk_api.VideoGrants(room_join=True, room=room)
-    at = lk_api.AccessToken(LK_KEY, LK_SECRET).with_identity(identity).with_name(identity).with_grants(grants)
-    return {"url": LK_URL, "token": at.to_jwt()}
+
+    # Формуємо JWT для LiveKit:
+    payload = {
+        "iss": LK_KEY,            # хто випустив
+        "sub": identity,          # ідентичність учасника
+        "name": identity,         # відобразиться як ім’я
+        "exp": int(time.time()) + 60 * 60,   # 1 година
+        "video": {
+            "room": room,
+            "roomJoin": True
+        }
+    }
+    token = jwt.encode(payload, LK_SECRET, algorithm="HS256", headers={"kid": LK_KEY})
+    return {"url": LK_URL, "token": token}
 
 @app.get("/health")
 def health():
