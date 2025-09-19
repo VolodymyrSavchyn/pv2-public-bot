@@ -70,30 +70,24 @@ def index():
     }
 
     async function unlockAudioPlayback() {
-      try {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) {
-          if (!audioCtx) audioCtx = new AC();
-          if (audioCtx.state === 'suspended') await audioCtx.resume();
-          log('AudioContext: ' + audioCtx.state);
-        } else {
-          log('AudioContext: unavailable');
-        }
-        if (room && typeof room.startAudio === 'function') {
-          const res = await room.startAudio();
-          log('room.startAudio() -> ' + res);
-        } else {
-          log('room.startAudio() not available');
-        }
-        document.querySelectorAll('audio').forEach(a => {
-          a.muted = false; a.volume = 1.0;
-          a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
-        });
-        unmuteBtn.style.display = 'none';
-        hintEl.style.display = 'none';
-      } catch (e) {
-        log('unlock error: ' + (e?.message || e));
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        if (!audioCtx) audioCtx = new AC();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        log('AudioContext: ' + audioCtx.state);
+      } else {
+        log('AudioContext: unavailable');
       }
+      if (room && typeof room.startAudio === 'function') {
+        const res = await room.startAudio();
+        log('room.startAudio() -> ' + res);
+      }
+      document.querySelectorAll('audio').forEach(a => {
+        a.muted = false; a.volume = 1.0;
+        a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
+      });
+      unmuteBtn.style.display = 'none';
+      hintEl.style.display = 'none';
     }
 
     async function getToken(roomName, identity) {
@@ -109,54 +103,69 @@ def index():
       log('mic published');
     }
 
-    // --- НОВЕ: примусова підписка на всі аудіо-треки учасника ---
-    function subscribeParticipantAudio(p) {
+    // ---- допоміжні ітератори під різні версії SDK ----
+    function listRemoteParticipants() {
+      const out = [];
+      const cand = room?.participants ?? room?.remoteParticipants ?? null;
+      if (!cand) { log('participants container missing: ' + String(cand)); return out; }
+
+      if (typeof cand.forEach === 'function') {
+        cand.forEach(v => out.push(v));
+      } else if (typeof cand === 'object') {
+        try { Object.keys(cand).forEach(k => out.push(cand[k])); }
+        catch { log('participants not iterable (object)'); }
+      } else {
+        log('participants map not iterable, value: ' + String(cand));
+      }
+      return out;
+    }
+
+    function listPublications(p) {
+      // v2: p.tracks (Map); v1: p.audioTracks/videoTracks; також може бути p.getTrackPublications()
+      if (typeof p.getTrackPublications === 'function') return p.getTrackPublications();
+      if (p.tracks && typeof p.tracks.forEach === 'function') {
+        const arr = []; p.tracks.forEach(pub => arr.push(pub)); return arr;
+      }
+      const arr = [];
+      if (p.audioTracks && typeof p.audioTracks.forEach === 'function') p.audioTracks.forEach(pub => arr.push(pub));
+      if (p.videoTracks && typeof p.videoTracks.forEach === 'function') p.videoTracks.forEach(pub => arr.push(pub));
+      return arr;
+    }
+
+    function forceSubscribeAudio(p) {
       try {
-        log('ensure subscribe for ' + (p.identity || 'unknown'));
-        // існуючі публікації
-        if (p.tracks && typeof p.tracks.forEach === 'function') {
-          p.tracks.forEach(pub => {
-            if (pub && pub.kind === 'audio') {
-              log('found pub(kind=audio) from ' + (p.identity || '?') + ', subscribed=' + pub.subscribed);
-              if (!pub.subscribed) {
-                pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok')).catch(e=>log('setSubscribed err: '+(e?.message||e)));
-              }
+        const pubs = listPublications(p);
+        pubs.forEach(pub => {
+          if (pub?.kind === 'audio') {
+            log(`pub audio from ${p.identity} subscribed=${pub.subscribed}`);
+            if (typeof pub.setSubscribed === 'function' && !pub.subscribed) {
+              pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok')).catch(e=>log('setSubscribed err: '+(e?.message||e)));
             }
-          });
-        }
-        // нові публікації
-        if (typeof p.on === 'function') {
-          p.on('trackPublished', (pub) => {
-            log('trackPublished from ' + (p.identity||'?') + ' kind=' + pub?.kind);
-            if (pub?.kind === 'audio' && !pub.subscribed) {
-              pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok (on publish)')).catch(e=>log('setSubscribed err (on publish): '+(e?.message||e)));
-            }
-          });
-        }
-      } catch (e) {
-        log('subscribeParticipantAudio error: ' + (e?.message || e));
+            // якщо трек уже присутній — одразу прикріпимо
+            const t = pub?.audioTrack || pub?.track;
+            if (t && t.kind === 'audio') appendAudio(t);
+          }
+        });
+      } catch(e) {
+        log('forceSubscribeAudio error: ' + (e?.message || e));
       }
     }
 
     function wireRoomEvents() {
       room.on('participantConnected', p => {
         log('participant connected: ' + p.identity);
-        subscribeParticipantAudio(p);
+        forceSubscribeAudio(p);
+        p.on?.('trackPublished', (pub) => {
+          log('trackPublished from ' + p.identity + ' kind=' + (pub?.kind));
+          if (pub?.kind === 'audio') {
+            pub.setSubscribed?.(true).then(()=>log('setSubscribed(true) ok (on publish)')).catch(e=>log('setSubscribed err (on publish): '+(e?.message||e)));
+          }
+        });
       });
       room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
       room.on('trackSubscribed', (track, pub, participant) => {
-        log('track subscribed from ' + (participant.identity||'?') + ' kind=' + (track?.kind));
+        log('track subscribed from ' + (participant?.identity || '?') + ' kind=' + (track?.kind));
         if (track?.kind === 'audio') appendAudio(track);
-      });
-      room.on('audioPlaybackStatusChanged', (playing) => {
-        log('audioPlaybackStatusChanged: ' + playing);
-        if (!playing) {
-          unmuteBtn.style.display = 'inline-block';
-          showHint('Натисни "Unmute / Start Audio", щоб увімкнути звук.');
-        } else {
-          unmuteBtn.style.display = 'none';
-          hintEl.style.display = 'none';
-        }
       });
       room.on('disconnected', () => log('room disconnected'));
     }
@@ -166,7 +175,6 @@ def index():
         joinBtn.disabled = true;
         const identity = nameEl.value.trim() || ('guest-' + Math.random().toString(16).slice(2));
         const roomName = new URLSearchParams(location.search).get('room') || 'pv2-demo';
-
         const { url, token } = await getToken(roomName, identity);
 
         await new Promise(res => {
@@ -175,34 +183,26 @@ def index():
           setTimeout(() => { clearInterval(id); res(); }, 2000);
         });
 
-        room = new LivekitClient.Room({ adaptiveStream: false, dynacast: false, autoSubscribe: true });
+        room = new LivekitClient.Room({ autoSubscribe: true, adaptiveStream: false, dynacast: false });
         await room.connect(url, token);
         log('connected as ' + identity + ' to room ' + roomName);
 
         wireRoomEvents();
 
-        // підписатися на всіх, хто вже в кімнаті (наприклад, pv2-agent)
-        try {
-          const parts = room.participants;
-          if (parts && typeof parts.forEach === 'function') {
-            parts.forEach((p, sid) => { log('existing participant: ' + p.identity); subscribeParticipantAudio(p); });
-          } else {
-            log('participants map not iterable, value: ' + String(parts));
-          }
-        } catch (e) {
-          log('iter participants err: ' + (e?.message || e));
-        }
+        // підпишемося на всіх, хто вже є (агент)
+        const remotes = listRemoteParticipants();
+        remotes.forEach(p => { log('existing participant: ' + (p?.identity || '?')); forceSubscribeAudio(p); });
 
         await enableMic(room);
 
-        // показати кнопку розблокування звуку
+        // анлок звуку
         unmuteBtn.style.display = 'inline-block';
         showHint('Браузер міг заблокувати звук. Натисни "Unmute / Start Audio".');
         await unlockAudioPlayback();
 
         leaveBtn.disabled = false;
       } catch (e) {
-        log('ERROR: ' + (e && e.message ? e.message : e));
+        log('ERROR: ' + (e?.message || e));
         joinBtn.disabled = false;
       }
     };
@@ -216,9 +216,7 @@ def index():
       }
     };
 
-    unmuteBtn.onclick = async () => {
-      await unlockAudioPlayback();
-    };
+    unmuteBtn.onclick = async () => { await unlockAudioPlayback(); };
   </script>
 </body>
 </html>""")
@@ -232,7 +230,10 @@ def token(room: str = Query(...), identity: str = Query(...)):
         "sub": identity,
         "name": identity,
         "exp": int(time.time()) + 60*60,
-        "video": {"room": room, "roomJoin": True, "canPublish": True, "canSubscribe": True, "canPublishData": True},
+        "video": {
+            "room": room, "roomJoin": True,
+            "canPublish": True, "canSubscribe": True, "canPublishData": True
+        },
     }
     token = jwt.encode(payload, LK_SECRET, algorithm="HS256", headers={"kid": LK_KEY})
     return {"url": LK_URL, "token": token}
