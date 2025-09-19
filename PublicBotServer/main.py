@@ -232,7 +232,7 @@ def token(room: str = Query(...), identity: str = Query(...)):
         "sub": identity,
         "name": identity,
         "exp": int(time.time()) + 60*60,
-        "video": {"room": room, "roomJoin": True},
+        "video": {"room": room, "roomJoin": True, "canPublish": True, "canSubscribe": True, "canPublishData": True},
     }
     token = jwt.encode(payload, LK_SECRET, algorithm="HS256", headers={"kid": LK_KEY})
     return {"url": LK_URL, "token": token}
