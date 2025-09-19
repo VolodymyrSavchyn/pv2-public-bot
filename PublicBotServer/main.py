@@ -43,6 +43,7 @@ def index():
     <button id="join">Join</button>
     <button id="leave" disabled>Leave</button>
     <button id="unmute" style="display:none;">Unmute / Start Audio</button>
+    <button id="resub" style="display:none;">Fix Sound</button>
   </div>
   <p>Після Join дозволь мікрофон. Агент відповість голосом. (Кімната: pv2-demo.)</p>
   <div id="log"></div>
@@ -51,12 +52,14 @@ def index():
   <script>
     let room = null;
     let audioCtx = null;
+    const audioEls = new Set();
 
     const logEl  = document.getElementById('log');
     const hintEl = document.getElementById('hint');
     const joinBtn = document.getElementById('join');
     const leaveBtn = document.getElementById('leave');
     const unmuteBtn = document.getElementById('unmute');
+    const resubBtn  = document.getElementById('resub');
     const nameEl = document.getElementById('name');
 
     const log = (m) => { logEl.textContent += m + "\\n"; logEl.scrollTop = logEl.scrollHeight; };
@@ -66,28 +69,31 @@ def index():
       const el = track.attach();
       el.autoplay = true; el.playsInline = true; el.muted = false; el.volume = 1.0;
       document.body.appendChild(el);
+      audioEls.add(el);
       el.play?.().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
     }
 
     async function unlockAudioPlayback() {
-      const AC = window.AudioContext || window.webkitAudioContext;
-      if (AC) {
-        if (!audioCtx) audioCtx = new AC();
-        if (audioCtx.state === 'suspended') await audioCtx.resume();
-        log('AudioContext: ' + audioCtx.state);
-      } else {
-        log('AudioContext: unavailable');
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          if (!audioCtx) audioCtx = new AC();
+          if (audioCtx.state === 'suspended') await audioCtx.resume();
+          log('AudioContext: ' + audioCtx.state);
+        }
+        if (room && typeof room.startAudio === 'function') {
+          const res = await room.startAudio();
+          log('room.startAudio() -> ' + res);
+        }
+        audioEls.forEach(a => {
+          a.muted = false; a.volume = 1.0;
+          a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
+        });
+        unmuteBtn.style.display = 'none';
+        hintEl.style.display = 'none';
+      } catch (e) {
+        log('unlock error: ' + (e?.message || e));
       }
-      if (room && typeof room.startAudio === 'function') {
-        const res = await room.startAudio();
-        log('room.startAudio() -> ' + res);
-      }
-      document.querySelectorAll('audio').forEach(a => {
-        a.muted = false; a.volume = 1.0;
-        a.play().then(()=>log('audio tag play() ok')).catch(e=>log('audio tag play() fail: ' + e?.message));
-      });
-      unmuteBtn.style.display = 'none';
-      hintEl.style.display = 'none';
     }
 
     async function getToken(roomName, identity) {
@@ -103,52 +109,36 @@ def index():
       log('mic published');
     }
 
-    // ---- допоміжні ітератори під різні версії SDK ----
+    // універсальні ітератори по учасниках/публікаціях (під різні версії SDK)
     function listRemoteParticipants() {
       const out = [];
       const cand = room?.participants ?? room?.remoteParticipants ?? null;
-      if (!cand) { log('participants container missing: ' + String(cand)); return out; }
-
-      if (typeof cand.forEach === 'function') {
-        cand.forEach(v => out.push(v));
-      } else if (typeof cand === 'object') {
-        try { Object.keys(cand).forEach(k => out.push(cand[k])); }
-        catch { log('participants not iterable (object)'); }
-      } else {
-        log('participants map not iterable, value: ' + String(cand));
-      }
+      if (!cand) return out;
+      if (typeof cand.forEach === 'function') cand.forEach(v => out.push(v));
+      else if (typeof cand === 'object') Object.keys(cand).forEach(k => out.push(cand[k]));
       return out;
     }
-
     function listPublications(p) {
-      // v2: p.tracks (Map); v1: p.audioTracks/videoTracks; також може бути p.getTrackPublications()
       if (typeof p.getTrackPublications === 'function') return p.getTrackPublications();
-      if (p.tracks && typeof p.tracks.forEach === 'function') {
-        const arr = []; p.tracks.forEach(pub => arr.push(pub)); return arr;
-      }
-      const arr = [];
-      if (p.audioTracks && typeof p.audioTracks.forEach === 'function') p.audioTracks.forEach(pub => arr.push(pub));
-      if (p.videoTracks && typeof p.videoTracks.forEach === 'function') p.videoTracks.forEach(pub => arr.push(pub));
-      return arr;
+      if (p.tracks && typeof p.tracks.forEach === 'function') { const arr=[]; p.tracks.forEach(pub=>arr.push(pub)); return arr; }
+      const arr=[]; p.audioTracks?.forEach?.(pub=>arr.push(pub)); p.videoTracks?.forEach?.(pub=>arr.push(pub)); return arr;
     }
-
     function forceSubscribeAudio(p) {
-      try {
-        const pubs = listPublications(p);
-        pubs.forEach(pub => {
-          if (pub?.kind === 'audio') {
-            log(`pub audio from ${p.identity} subscribed=${pub.subscribed}`);
-            if (typeof pub.setSubscribed === 'function' && !pub.subscribed) {
-              pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok')).catch(e=>log('setSubscribed err: '+(e?.message||e)));
-            }
-            // якщо трек уже присутній — одразу прикріпимо
-            const t = pub?.audioTrack || pub?.track;
-            if (t && t.kind === 'audio') appendAudio(t);
+      const pubs = listPublications(p);
+      pubs.forEach(pub => {
+        if (pub?.kind === 'audio') {
+          log(`pub audio from ${p.identity} subscribed=${pub.subscribed}`);
+          if (typeof pub.setSubscribed === 'function' && !pub.subscribed) {
+            pub.setSubscribed(true).then(()=>log('setSubscribed(true) ok')).catch(e=>log('setSubscribed err: '+(e?.message||e)));
           }
-        });
-      } catch(e) {
-        log('forceSubscribeAudio error: ' + (e?.message || e));
-      }
+          const t = pub?.audioTrack || pub?.track;
+          if (t && t.kind === 'audio') appendAudio(t);
+        }
+      });
+    }
+    function resubAll() {
+      listRemoteParticipants().forEach(p => forceSubscribeAudio(p));
+      unlockAudioPlayback();
     }
 
     function wireRoomEvents() {
@@ -157,15 +147,16 @@ def index():
         forceSubscribeAudio(p);
         p.on?.('trackPublished', (pub) => {
           log('trackPublished from ' + p.identity + ' kind=' + (pub?.kind));
-          if (pub?.kind === 'audio') {
-            pub.setSubscribed?.(true).then(()=>log('setSubscribed(true) ok (on publish)')).catch(e=>log('setSubscribed err (on publish): '+(e?.message||e)));
-          }
+          if (pub?.kind === 'audio') pub.setSubscribed?.(true).then(()=>log('setSubscribed(true) ok (on publish)')).catch(e=>log('setSubscribed err (on publish): '+(e?.message||e)));
         });
       });
       room.on('participantDisconnected', p => log('participant disconnected: ' + p.identity));
-      room.on('trackSubscribed', (track, pub, participant) => {
+      room.on('trackSubscribed', async (track, pub, participant) => {
         log('track subscribed from ' + (participant?.identity || '?') + ' kind=' + (track?.kind));
-        if (track?.kind === 'audio') appendAudio(track);
+        if (track?.kind === 'audio') {
+          appendAudio(track);
+          await unlockAudioPlayback();     // ← ключ: при кожній підписці знову розблоковуємо відтворення
+        }
       });
       room.on('disconnected', () => log('room disconnected'));
     }
@@ -189,15 +180,15 @@ def index():
 
         wireRoomEvents();
 
-        // підпишемося на всіх, хто вже є (агент)
-        const remotes = listRemoteParticipants();
-        remotes.forEach(p => { log('existing participant: ' + (p?.identity || '?')); forceSubscribeAudio(p); });
+        // підпишемось на всіх, хто вже є (агент)
+        listRemoteParticipants().forEach(p => { log('existing participant: ' + (p?.identity || '?')); forceSubscribeAudio(p); });
 
         await enableMic(room);
 
-        // анлок звуку
+        // кнопки "розблокувати" і "ресаб"
         unmuteBtn.style.display = 'inline-block';
-        showHint('Браузер міг заблокувати звук. Натисни "Unmute / Start Audio".');
+        resubBtn.style.display  = 'inline-block';
+        showHint('Якщо тихо — натисни "Unmute / Start Audio" або "Fix Sound".');
         await unlockAudioPlayback();
 
         leaveBtn.disabled = false;
@@ -211,12 +202,11 @@ def index():
       try {
         leaveBtn.disabled = true;
         if (room) { await room.disconnect(); room = null; log('left room'); }
-      } finally {
-        joinBtn.disabled = false;
-      }
+      } finally { joinBtn.disabled = false; }
     };
 
     unmuteBtn.onclick = async () => { await unlockAudioPlayback(); };
+    resubBtn.onclick  = () => { resubAll(); };
   </script>
 </body>
 </html>""")
